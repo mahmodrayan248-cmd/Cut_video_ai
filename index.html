@@ -284,7 +284,12 @@ const analyzeMain=async()=>{
   const dur=V.duration, n=Math.max(1,Math.floor(dur));
   PCM=null;
   let au=new Float32Array(n),hasAu=false,mo=new Float32Array(n),hasMo=false;
-  try{
+  STREAM=false;WIN=[];
+  if(file.size>BIG&&canStream()){
+    try{prog(.02,'ملف كبير: جاري قراءة الصوت بالبث…');au=await streamRMS(n);hasAu=true;STREAM=true}
+    catch(e){if(CANCEL){prog(0,'تم الإيقاف.');btn.disabled=false;return}}
+  }
+  if(!hasAu&&file.size<=HARD)try{
     prog(.02,'جاري قراءة الصوت…');
     const ab=await new OfflineAudioContext(1,1,16000).decodeAudioData(await file.arrayBuffer());
     const d=ab.getChannelData(0),sr=ab.sampleRate;PCM=d;
@@ -294,7 +299,7 @@ const analyzeMain=async()=>{
   if($('#mo').checked){
     const cv=document.createElement('canvas');cv.width=32;cv.height=18;
     const c=cv.getContext('2d',{willReadFrequently:true});
-    const st=Math.max(1,Math.ceil(n/200)),m=[];let prev=null;
+    const st=Math.max(1,Math.ceil(n/(n>3600?400:200))),m=[];let prev=null;
     for(let t=0;t<n;t+=st){
       if(CANCEL)break;
       await seek(t+.5); c.drawImage(V,0,0,32,18);
@@ -327,7 +332,7 @@ const analyzeMain=async()=>{
   clips=pick.map((p,k)=>({k:k+1,s:p.i,e:Math.min(dur,p.i+L),p:Math.round(100*p.v/best),f:[...p.f,p.vn===undefined?.5:p.vn]}));
   prog(1,'تم! لقيت '+clips.length+' مقطع.');
   btn.disabled=false; showResults();
-  if($('#sub').checked){if(PCM){btn.disabled=true;await transcribeAll();btn.disabled=false}else prog(1,'ما قدرت أقرأ صوت الفيديو للترجمة، لكن المقاطع جاهزة.')}
+  if($('#sub').checked){if(PCM||STREAM){btn.disabled=true;if(STREAM){try{prog(.97,'جاري تجهيز الصوت للترجمة…');await prefetchClips()}catch(e){}}await transcribeAll();btn.disabled=false}else prog(1,'ما قدرت أقرأ صوت الفيديو للترجمة، لكن المقاطع جاهزة.')}
   if($('#face').checked&&$('#mode').value==='crop'){btn.disabled=true;await trackAll();btn.disabled=false}
 };
 $('#go').onclick=async()=>{try{await analyzeMain()}finally{$('#stop').hidden=true;$('#go').disabled=false}};
@@ -398,7 +403,7 @@ async function exportClip(c,btn,quiet){
   const ML=['video/mp4;codecs=avc1','video/mp4','video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'],mime=($('#fmt').value==='webm'?ML.slice(2):ML).find(m=>MediaRecorder.isTypeSupported(m))||'';
   try{
     initAudio();V.pause();stopAt=0;
-    let cuts=[];if($('#jc').checked&&await ensurePCM())cuts=silences(c);
+    let cuts=[];if($('#jc').checked&&await ensurePCM()){const a0=Math.floor(c.s*16000),P=await pcmRange(a0,Math.floor(c.e*16000));if(P)cuts=silences(c,P,a0)}
     await seek(c.s);mon.gain.value=0;await AC.resume();
     if(MUS){if(!MUS.n){MUS.n=AC.createMediaElementSource(MUS.a);MUS.g=AC.createGain();MUS.n.connect(MUS.g);MUS.g.connect(dest)}
       MUS.g.gain.value=+$('#muv').value;MUS.a.currentTime=0;MUS.a.play().catch(()=>{})}
@@ -518,7 +523,7 @@ function rewords(x){
 }
 async function transcribeOne(c,asr){
   const dur=V.duration,pad=$('#snap').checked?18:6,ps=Math.max(0,c.s-pad),pe=Math.min(dur,c.e+pad);
-  const a=PCM.slice(Math.floor(ps*16000),Math.floor(pe*16000));
+  const a=await pcmRange(Math.floor(ps*16000),Math.floor(pe*16000));if(!a)return;
   try{
     const o={chunk_length_s:30,stride_length_s:5,task:$('#tr').value==='en'?'translate':'transcribe',language:$('#lang').value};
     let r,isW=true;
@@ -737,10 +742,13 @@ function delClip(c){
   drawTL();
 }
 async function ensurePCM(){
-  if(PCM)return true;
-  try{prog(.02,'جاري قراءة الصوت…');
-    const ab=await new OfflineAudioContext(1,1,16000).decodeAudioData(await file.arrayBuffer());PCM=ab.getChannelData(0);return true}
-  catch(e){return false}
+  if(PCM||STREAM)return true;
+  if(file.size<=BIG||!canStream()){
+    try{prog(.02,'جاري قراءة الصوت…');
+      const ab=await new OfflineAudioContext(1,1,16000).decodeAudioData(await file.arrayBuffer());PCM=ab.getChannelData(0);return true}
+    catch(e){return false}
+  }
+  STREAM=true;return true;
 }
 async function transOne(c,btn){
   btn.disabled=true;
@@ -865,10 +873,73 @@ $('#libb').onclick=openLib;
 $('#libclr').onclick=async()=>{if(!LIB.length||!confirm('حذف كل المقاطع من المكتبة؟'))return;LIB.forEach(i=>i.url&&URL.revokeObjectURL(i.url));LIB=[];await idb('clear');renderLib()};
 loadLib();
 
+/* ===== قراءة الصوت بالبث للملفات الكبيرة (بدون تحميل الملف كله بالذاكرة) ===== */
+const BIG=3.5e8,HARD=1.6e9;let STREAM=false,WIN=[];
+const canStream=()=>typeof AudioDecoder!=='undefined'&&typeof EncodedAudioChunk!=='undefined';
+const loadMp4Box=()=>window.MP4Box?Promise.resolve():new Promise((ok,no)=>{const x=document.createElement('script');x.src='https://cdn.jsdelivr.net/npm/mp4box@0.5.2/dist/mp4box.all.min.js';x.onload=ok;x.onerror=()=>no(new Error('mp4box'));document.head.appendChild(x)});
+const monoOf=a=>{const N=a.numberOfFrames,m=new Float32Array(N);a.copyTo(m,{planeIndex:0,format:'f32-planar'});if(a.numberOfChannels>1){const r=new Float32Array(N);a.copyTo(r,{planeIndex:1,format:'f32-planar'});for(let i=0;i<N;i++)m[i]=(m[i]+r[i])*.5}return m};
+async function pump(onFrame,onProg){
+  await loadMp4Box();
+  const mp4=MP4Box.createFile();let dec=null,err=null;
+  mp4.onError=e=>{err=e||new Error('mp4')};
+  mp4.onReady=info=>{
+    try{
+      const t=info.audioTracks[0];if(!t)throw new Error('noaudio');
+      const en=mp4.getTrackById(t.id).mdia.minf.stbl.stsd.entries[0],d=en.esds&&en.esds.esd.descs[0]&&en.esds.esd.descs[0].descs[0];
+      const cfg={codec:t.codec,sampleRate:t.audio.sample_rate,numberOfChannels:t.audio.channel_count};if(d&&d.data)cfg.description=d.data;
+      dec=new AudioDecoder({output:a=>{try{onFrame(a)}finally{a.close()}},error:e=>{err=e}});dec.configure(cfg);
+      mp4.setExtractionOptions(t.id,null,{nbrSamples:500});mp4.start();
+    }catch(e){err=e}
+  };
+  mp4.onSamples=(id,u,ss)=>{
+    if(!dec||err||!ss.length)return;
+    for(const x of ss)dec.decode(new EncodedAudioChunk({type:x.is_sync?'key':'delta',timestamp:Math.round(1e6*x.cts/x.timescale),duration:Math.round(1e6*x.duration/x.timescale),data:x.data}));
+    mp4.releaseUsedSamples(id,ss[ss.length-1].number+1);
+  };
+  const sz=file.size,CH=8<<20;let off=0,guard=0;
+  while(off<sz&&!err){
+    if(CANCEL)throw new Error('cancel');
+    if(++guard>(sz/CH)*6+60)break;
+    const b=await file.slice(off,Math.min(sz,off+CH)).arrayBuffer();b.fileStart=off;
+    const nx=mp4.appendBuffer(b);onProg&&onProg(Math.min(1,off/sz));
+    off=(nx===undefined||nx===null)?off+b.byteLength:nx;
+    while(dec&&dec.decodeQueueSize>300&&!err)await new Promise(r=>setTimeout(r,4));
+  }
+  mp4.flush();
+  if(dec&&!err){await dec.flush()}
+  if(dec&&dec.state!=='closed')dec.close();
+  if(err||!dec)throw (err||new Error('noaudio'));
+}
+/* شدة الصوت لكل ثانية (للتحليل) */
+async function streamRMS(n){
+  const sum=new Float64Array(n+2),cnt=new Uint32Array(n+2);
+  await pump(a=>{const m=monoOf(a),sr=a.sampleRate,t0=a.timestamp/1e6;for(let i=0;i<m.length;i+=2){const k=Math.floor(t0+i/sr);if(k>=0&&k<=n){sum[k]+=m[i]*m[i];cnt[k]++}}},
+    p=>prog(.02+.07*p,'جاري قراءة الصوت… '+Math.round(p*100)+'%'));
+  const r=new Float32Array(n);for(let i=0;i<n;i++)r[i]=Math.sqrt(sum[i]/Math.max(1,cnt[i]));
+  return r;
+}
+/* صوت 16kHz لنوافذ محددة فقط (مقاطع الترجمة) */
+async function fillWin(ranges){
+  const W=ranges.map(([a,b])=>({a,b,s:new Float32Array(b-a),c:new Uint16Array(b-a)}));
+  await pump(x=>{
+    const t0=x.timestamp/1e6,sr=x.sampleRate,N=x.numberOfFrames,A=t0*16000,B=(t0+N/sr)*16000,hit=W.filter(w=>A<w.b&&B>w.a);
+    if(!hit.length)return;const m=monoOf(x);
+    for(const w of hit){const L=w.b-w.a;for(let i=0;i<N;i++){const k=Math.floor((t0+i/sr)*16000)-w.a;if(k>=0&&k<L){w.s[k]+=m[i];w.c[k]++}}}
+  },p=>prog(.97,'جاري تجهيز الصوت… '+Math.round(p*100)+'%'));
+  for(const w of W){const d=w.s;for(let i=0;i<d.length;i++)d[i]=w.c[i]?d[i]/w.c[i]:(i?d[i-1]:0);WIN.push({a:w.a,b:w.b,d})}
+}
+const prefetchClips=()=>{const pad=($('#snap').checked?18:6)+2,dur=V.duration;return fillWin(clips.map(c=>[Math.floor(Math.max(0,c.s-pad)*16000),Math.floor(Math.min(dur,c.e+pad)*16000)]))};
+async function pcmRange(a,b){
+  if(PCM)return PCM.slice(a,Math.min(b,PCM.length));
+  const f=()=>WIN.find(w=>w.a<=a&&w.b>=b);
+  if(!f()){try{await fillWin([[a,b]])}catch(e){return null}}
+  const w=f();return w?w.d.slice(a-w.a,b-w.a):null;
+}
+
 /* ===== حذف الصمت (Jump Cut) ===== */
-function silences(c){
-  const sr=16000,w=800,a0=Math.floor(c.s*sr),a1=Math.min(PCM.length,Math.floor(c.e*sr)),n=Math.floor((a1-a0)/w),r=new Float32Array(n);
-  for(let i=0;i<n;i++){let t=0;for(let j=0;j<w;j+=4){const v=PCM[a0+i*w+j];t+=v*v}r[i]=Math.sqrt(t/(w/4))}
+function silences(c,P,base){
+  const sr=16000,w=800,a0=Math.floor(c.s*sr),a1=Math.min(base+P.length,Math.floor(c.e*sr)),n=Math.floor((a1-a0)/w),r=new Float32Array(n);
+  for(let i=0;i<n;i++){let t=0;for(let j=0;j<w;j+=4){const v=P[a0-base+i*w+j];t+=v*v}r[i]=Math.sqrt(t/(w/4))}
   const ref=Array.from(r).sort((x,y)=>x-y)[Math.floor(n*.9)]||0,th=Math.max(.004,ref*.12),out=[];
   let st=-1;
   for(let i=0;i<=n;i++){
