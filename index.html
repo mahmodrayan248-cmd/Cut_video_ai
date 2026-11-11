@@ -202,6 +202,7 @@ input[type=file]{width:100%;margin-top:6px;font:inherit;color:var(--mut)}
   <label class="sw"><span><b>تحليل الحركة</b><small>أدق بالاختيار لكن أبطأ</small></span><input type="checkbox" id="mo" checked></label>
   <label class="sw"><span><b>ترجمة محروقة</b><small>تفريغ الكلام على جهازك وكتابته على الفيديو</small></span><input type="checkbox" id="sub" checked></label>
   <label class="sw"><span><b>قص ذكي وعنوان</b><small>بداية ونهاية عند حدود الجمل مع عنوان ووصف (يحتاج خيار الترجمة شغّال)</small></span><input type="checkbox" id="snap" checked></label>
+  <label class="sw"><span><b>قص حسب الفكرة (بودكاست)</b><small>يفرّغ الكلام كله ويقص كل فكرة من أولها لآخرها، بفهم المعنى. أول مرة بينزّل نموذج صغير. حد أقصى 40 دقيقة</small></span><input type="checkbox" id="idea"></label>
   <div class="subopt two">
    <label>لغة الكلام<select id="lang"><option value="arabic">عربي</option><option value="english">English</option></select></label>
    <label>نموذج الكلام<select id="mdl"><option value="base">خفيف وسريع (75 ميغا)</option><option value="small">دقيق (250 ميغا)</option></select></label>
@@ -321,6 +322,14 @@ const analyzeMain=async()=>{
   score=smooth(A.map((_,i)=>wa*A[i]+ws*sp[i]+wm*M[i]),1);
   FEAT={A,sp,M};
   const rs=Math.max(0,Math.min(n-1,Math.floor(+$('#rs').value||0))),re=Math.min(n,Math.floor(+$('#re').value)||n),R=re>rs+3?[rs,re]:[0,n];
+  if($('#idea').checked){
+    if(PCM||STREAM){
+      let ok=false;try{ok=await ideaMode(R,dur,score)}catch(e){console.error(e)}
+      if(CANCEL){prog(0,'تم الإيقاف.');btn.disabled=false;return}
+      if(ok){btn.disabled=false;showResults();if($('#face').checked&&$('#mode').value==='crop'){btn.disabled=true;await trackAll();btn.disabled=false}return}
+      prog(.95,'ما نجح قص الفكرة، بكمّل بالطريقة العادية…');
+    }else prog(.95,'قص الفكرة بيحتاج قراءة الصوت. بكمّل بالطريقة العادية…');
+  }
   const L=Math.min(curLen(),R[1]-R[0]),K=+$('#cnt').value,W=[];
   for(let i=R[0];i+L<=R[1];i++){let s=0,mx=0,fa=0,fp=0,fm=0;for(let j=i;j<i+L;j++){s+=score[j];mx=Math.max(mx,score[j]);fa+=A[j];fp+=sp[j];fm+=M[j]}W.push({i,v:.6*s/L+.4*mx,f:[fa/L,fp/L,fm/L]})}
   W.sort((a,b)=>b.v-a.v);
@@ -448,7 +457,7 @@ self.onmessage=async e=>{
     }
     if(m.cmd==='run'){
       const inp=m.img?new RawImage(new Uint8ClampedArray(m.img.data),m.img.w,m.img.h,3):m.input;
-      const r=m.labels?await P[m.key](inp,m.labels):await P[m.key](inp,m.opts||{});
+      let r=m.labels?await P[m.key](inp,m.labels):await P[m.key](inp,m.opts||{});if(r&&r.tolist)r=r.tolist();
       self.postMessage({id:m.id,t:'ok',r:JSON.parse(JSON.stringify(r))});
     }
   }catch(err){self.postMessage({id:m.id,t:'err',msg:String((err&&err.message)||err)})}
@@ -477,7 +486,7 @@ async function mainCall(m,on){
     throw last;
   }
   const inp=m.img?new T.RawImage(new Uint8ClampedArray(m.img.data),m.img.w,m.img.h,3):m.input;
-  const r=m.labels?await MPIPE[m.key](inp,m.labels):await MPIPE[m.key](inp,m.opts||{});
+  let r=m.labels?await MPIPE[m.key](inp,m.labels):await MPIPE[m.key](inp,m.opts||{});if(r&&r.tolist)r=r.tolist();
   return JSON.parse(JSON.stringify(r));
 }
 function noteNoWorker(){
@@ -550,6 +559,69 @@ async function transcribeAll(){
   }
   drawTL();
   prog(1,'تمت الترجمة ✅');
+}
+/* ===== قص حسب الفكرة: تفريغ كل الكلام ← جمل ← تغيّر الموضوع بالمعنى (نموذج e5 صغير) ← أفضل الأفكار ===== */
+const sentsOf=W=>{const o=[],end=/[.!?؟…]["'”»)]*$/;let cur=[];
+  W.forEach((w,i)=>{cur.push(w);const nx=W[i+1];if(!nx||end.test(w.t)||nx.s-w.e>.7||cur.length>=40){o.push({s:cur[0].s,e:w.e,t:cur.map(x=>x.t).join(' '),w:cur});cur=[]}});return o};
+async function embedSents(S){
+  await wcall({cmd:'load',key:'emb',task:'feature-extraction',model:'Xenova/multilingual-e5-small',hosts:HOSTS,devs:['wasm'],dtype:'q8'},null,p=>prog(.05,'تنزيل نموذج المعاني (مرة وحدة فقط)… '+Math.round(p)+'%'));
+  const out=[];
+  for(let i=0;i<S.length;i+=16){if(CANCEL)return null;prog(.5+.3*i/S.length,'فهم المعنى… '+Math.round(100*i/S.length)+'%');
+    out.push(...await wcall({cmd:'run',key:'emb',input:S.slice(i,i+16).map(x=>'query: '+x.t),opts:{pooling:'mean',normalize:true}}))}
+  return out;
+}
+const toks=t=>t.toLowerCase().replace(/[^\p{L}\s]/gu,'').split(/\s+/).filter(w=>w.length>3&&!STOP.has(w));
+function repOf(E,S,a,b){
+  if(E){const m=new Array(E[0].length).fill(0);for(let i=a;i<b;i++)for(let j=0;j<m.length;j++)m[j]+=E[i][j];return m}
+  const st=new Set();for(let i=a;i<b;i++)toks(S[i].t).forEach(w=>st.add(w));return st;
+}
+function simOf(x,y){
+  if(Array.isArray(x)){let d=0,a=0,b=0;for(let i=0;i<x.length;i++){d+=x[i]*y[i];a+=x[i]*x[i];b+=y[i]*y[i]}return d/Math.sqrt(a*b||1)}
+  let n=0;x.forEach(w=>y.has(w)&&n++);return n/(x.size+y.size-n||1);
+}
+async function ideaMode(R,dur,sc){
+  const t0=R[0],T=Math.min(R[1]-R[0],2400),CH=300;
+  prog(0,'جاري تجهيز نموذج الكلام…');
+  let asr;try{asr=await loadASR($('#mdl').value)}catch(e){prog(1,'ما قدرت أحمّل نموذج الكلام.');return false}
+  const AW=[],o={chunk_length_s:30,stride_length_s:5,task:$('#tr').value==='en'?'translate':'transcribe',language:$('#lang').value};
+  for(let a=t0;a<t0+T;a+=CH){
+    if(CANCEL)return false;
+    prog(.05+.4*(a-t0)/T,'تفريغ الكلام… '+Math.round(100*(a-t0)/T)+'%');
+    const b=Math.min(t0+T,a+CH),pcm=await pcmRange(Math.floor(a*16000),Math.floor(b*16000));if(!pcm)continue;
+    let r;try{r=await asr(pcm.slice(0),{...o,return_timestamps:'word'})}catch(e){try{r=await asr(pcm,{...o,return_timestamps:true})}catch(e2){continue}}
+    (r.chunks||[]).forEach(x=>{const ws=(x.text||'').trim().split(/\s+/).filter(Boolean),s0=a+(x.timestamp[0]||0),e0=a+(x.timestamp[1]??(x.timestamp[0]||0)+.4),d=(e0-s0)/Math.max(1,ws.length);
+      ws.forEach((t,i)=>AW.push({t,s:s0+d*i,e:s0+d*(i+1)}))});
+  }
+  const S=sentsOf(AW);if(S.length<6){prog(1,'الكلام قليل أو ما انفرّغ.');return false}
+  let E=null;try{E=await embedSents(S)}catch(e){console.error(e)}
+  if(CANCEL)return false;
+  if(!E)prog(.85,'نموذج المعاني ما اشتغل، بستعمل تشابه الكلمات…');
+  /* تغيّر الموضوع: تشابه نافذة 4 جمل قبل مع 4 بعد، وأدنى نقطة محلية */
+  const g=[];for(let i=1;i<S.length;i++)g.push(simOf(repOf(E,S,Math.max(0,i-4),i),repOf(E,S,i,Math.min(S.length,i+4))));
+  const mu=g.reduce((a,b)=>a+b,0)/g.length,sd=Math.sqrt(g.reduce((a,b)=>a+(b-mu)**2,0)/g.length),B=[0];
+  g.forEach((v,i)=>{if(v<mu-.5*sd&&v<=Math.min(...g.slice(Math.max(0,i-3),i+4))&&S[i+1].s-S[B[B.length-1]].s>=20)B.push(i+1)});
+  const ideas=[];
+  B.forEach((a,k)=>{let b=(B[k+1]??S.length)-1;
+    while(a<b&&/^(طيب|يعني|okay|ok|so|well|اه|آه)[\s،,.]*$/i.test(S[a].t))a++;
+    if(a>0&&/^(لأنو|لانو|بس|وهاد|وهذا|but|because)\b/i.test(S[a].t)&&S[b].e-S[a-1].s<=90)a--;
+    if(/[؟?]\s*$/.test(S[b].t)&&b<S.length-1&&S[b+1].e-S[a].s<=90)b++;
+    while(b>a&&S[b].e-S[a].s>90)b--;
+    if(S[b].e-S[a].s>=10)ideas.push({a,b})});
+  if(!ideas.length)return false;
+  ideas.forEach(d=>{const w=[];let n=0;const f={};for(let i=d.a;i<=d.b;i++){n+=S[i].w.length;toks(S[i].t).forEach(x=>f[x]=(f[x]||0)+1)}
+    d.s=S[d.a].s;d.e=S[d.b].e;d.kw=Object.values(f).filter(c=>c>=2).reduce((x,y)=>x+y,0)/Math.max(1,n);
+    let z=0,c=0;for(let j=Math.floor(d.s);j<Math.ceil(d.e);j++)if(sc[j]!==undefined){z+=sc[j];c++}d.au=z/Math.max(1,c);
+    d.de=n/(d.e-d.s);d.cp=/[.!?؟…]["'”»)]*\s*$/.test(S[d.b].t)?1:.5});
+  const mx=k=>Math.max(...ideas.map(d=>d[k]))||1;
+  ideas.forEach(d=>d.v=.4*d.kw/mx('kw')+.3*d.au/mx('au')+.2*d.de/mx('de')+.1*d.cp);
+  ideas.sort((a,b)=>b.v-a.v);
+  const K=+$('#cnt').value,pk=[];
+  for(const d of ideas){if(pk.length>=K)break;if(pk.every(p=>d.s>=p.e+90||d.e<=p.s-90))pk.push(d)}
+  const best=pk[0].v||1;
+  clips=pk.map((d,i)=>{const c={k:i+1,s:d.s,e:Math.min(dur,d.e),p:Math.round(100*d.v/best),f:[d.kw,d.au,d.de,.5],idea:true};
+    c.subs=groupWords(S.slice(d.a,d.b+1).flatMap(x=>x.w),c);if(c.subs.length)meta(c);return c});
+  prog(1,'تم! لقيت '+clips.length+' فكرة.');
+  return true;
 }
 /* قص ذكي: البداية عند أول جملة والنهاية عند آخر جملة. الجملة تنتهي بعلامة ترقيم أو وقفة أطول من 0.7 ثانية. ما بنقص من نص الجملة أبدًا */
 function snap(c,ch,ed){
